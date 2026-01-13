@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <optional>
 #include "eviction.h"
+#include <atomic>
 
 using namespace std;
 
