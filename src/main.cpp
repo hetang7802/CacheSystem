@@ -52,7 +52,7 @@ int main() {
     bool isDistributed = false;
     string input;
 
-    cout << "in-memory Cache System (Phase 1, 2, 3 & 4)" << endl;
+    cout << "in-memory Cache System" << endl;
     cout << "Type 'HELP' for available commands" << endl;
     cout << "Mode: LOCAL" << endl << endl;
 

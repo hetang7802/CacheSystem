@@ -1,0 +1,15 @@
+
+Scenario 1: Normal Operations
+[node1] Server started on port 5001 (Windows Winsock)
+[CONTROLLER] Started node node1 on port 5001 (PID: 12228)
+[node2] Server started on port 5002 (Windows Winsock)
+[CONTROLLER] Started node node2 on port 5002 (PID: 9208)
+
+=== Running Uniform Workload (Windows) ===
+
+--- Metrics ---
+Total Operations: 450
+Successful: 363 (80.6667%)
+Failed: 87 (19.3333%)
+
+=== Simulation Complete ===
