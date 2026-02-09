@@ -1,2 +1,1 @@
-# Distributed in-memory Cache System - Phase 1
-
+# Distributed in-memory Cache System 
