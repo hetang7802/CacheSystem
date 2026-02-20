@@ -17,6 +17,7 @@ bool DistributedCache::addNode(const string& nodeId) {
     unique_lock<shared_mutex> lock(mutex);
     
     Node node(nodeId);
+    createNodeCache(nodeId);
     return hashRing.addNode(node);
 }
 
@@ -55,7 +56,7 @@ bool DistributedCache::removeNode(const string& nodeId) {
         }
         
         // Write to primary node
-        auto primaryCache = getOrCreateNodeCache(node->id);
+        auto primaryCache = getNodeCache(node->id);
         if(value.hasExpiry){
             auto remainingDuration = chrono::duration_cast<chrono::seconds>(
                 value.expiryTime - chrono::system_clock::now()
@@ -74,7 +75,7 @@ bool DistributedCache::removeNode(const string& nodeId) {
         auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1);
         
         for (const auto& replicaNode : replicas) {
-            auto replicaCache = getOrCreateNodeCache(replicaNode->id);
+            auto replicaCache = getNodeCache(replicaNode->id);
             if(value.hasExpiry){
                 auto remainingDuration = chrono::duration_cast<chrono::seconds>(
                     value.expiryTime - chrono::system_clock::now()
@@ -94,16 +95,20 @@ bool DistributedCache::removeNode(const string& nodeId) {
     return true;
 }
 
-shared_ptr<Cache> DistributedCache::getOrCreateNodeCache(const string& nodeId) {
-    auto it = nodeCache.find(nodeId);
-    if (it != nodeCache.end()) {
-        return it->second;
-    }
-    
+shared_ptr<Cache> DistributedCache::createNodeCache(const string& nodeId){
     // Create new cache for this node
     auto cache = make_shared<Cache>(evictionPolicy, maxCapacityPerNode);
     nodeCache[nodeId] = cache;
     return cache;
+}
+
+shared_ptr<Cache> DistributedCache::getNodeCache(const string& nodeId) {
+    auto it = nodeCache.find(nodeId);
+    if (it != nodeCache.end()) {
+        return it->second;
+    }
+
+    throw invalid_argument("could not find node with provided id " + nodeId);
 }
 
 bool DistributedCache::set(const string& key, const string& value) {
@@ -117,14 +122,14 @@ bool DistributedCache::set(const string& key, const string& value) {
     
     // Write to primary healthy node
     auto primaryNode = healthyNodes[0];
-    auto primaryCache = getOrCreateNodeCache(primaryNode->id);
+    auto primaryCache = getNodeCache(primaryNode->id);
     if (!primaryCache->set(key, value)) {
         return false;
     }
     
     // Replicate to remaining healthy replica nodes
     for (size_t i = 1; i < healthyNodes.size(); ++i) {
-        auto replicaCache = getOrCreateNodeCache(healthyNodes[i]->id);
+        auto replicaCache = getNodeCache(healthyNodes[i]->id);
         replicaCache->set(key, value);  // Write to replica (ignore capacity errors for replicas)
     }
     
@@ -142,14 +147,14 @@ bool DistributedCache::setWithTtl(const string& key, const string& value, int tt
     
     // Write to primary healthy node with TTL
     auto primaryNode = healthyNodes[0];
-    auto primaryCache = getOrCreateNodeCache(primaryNode->id);
+    auto primaryCache = getNodeCache(primaryNode->id);
     if (!primaryCache->setWithTtl(key, value, ttlSeconds)) {
         return false;
     }
     
     // Replicate to remaining healthy replica nodes with same TTL
     for (size_t i = 1; i < healthyNodes.size(); ++i) {
-        auto replicaCache = getOrCreateNodeCache(healthyNodes[i]->id);
+        auto replicaCache = getNodeCache(healthyNodes[i]->id);
         replicaCache->setWithTtl(key, value, ttlSeconds);  // Write to replica
     }
     
@@ -166,7 +171,7 @@ optional<string> DistributedCache::get(const string& key) {
     if (primaryNode) {
         if (failedNodes.find(primaryNode->id) == failedNodes.end()) {
             // Primary is healthy - check it
-            auto primaryCache = getOrCreateNodeCache(primaryNode->id);
+            auto primaryCache = getNodeCache(primaryNode->id);
             auto value = primaryCache->get(key);
             if (value) {
                 return value;  // Found on primary
@@ -191,7 +196,7 @@ optional<string> DistributedCache::get(const string& key) {
                 continue;
             }
             
-            auto replicaCache = getOrCreateNodeCache(replicaNode->id);
+            auto replicaCache = getNodeCache(replicaNode->id);
             auto value = replicaCache->get(key);
             if (value) {
                 return value;  // Found on replica
@@ -212,7 +217,7 @@ bool DistributedCache::exists(const string& key) {
     if (primaryNode) {
         if (failedNodes.find(primaryNode->id) == failedNodes.end()) {
             // Primary is healthy - check it
-            auto primaryCache = getOrCreateNodeCache(primaryNode->id);
+            auto primaryCache = getNodeCache(primaryNode->id);
             if (primaryCache->exists(key)) {
                 return true;  // Found on primary
             }
@@ -237,7 +242,7 @@ bool DistributedCache::exists(const string& key) {
                 continue;
             }
             
-            auto replicaCache = getOrCreateNodeCache(replicaNode->id);
+            auto replicaCache = getNodeCache(replicaNode->id);
             if (replicaCache->exists(key)) {
                 return true;  // Found on replica
             }
@@ -261,7 +266,7 @@ bool DistributedCache::del(const string& key) {
     
     // Delete from all healthy nodes to keep consistency
     for (const auto& node : healthyNodes) {
-        auto cache = getOrCreateNodeCache(node->id);
+        auto cache = getNodeCache(node->id);
         if (cache->del(key)) {
             deleted = true;  // At least one deletion succeeded
         }

@@ -167,16 +167,15 @@ private:
      * @param key The key to check
      * @return true if key was removed due to expiry
      */
-    bool removeIfExpired(const string& key);
+    // bool removeIfExpired(const string& key);
 
     /**
      * Enforce capacity limits (must be called with lock held)
      * Evicts keys according to policy until under capacity
      */
     void enforceCapacity();
-    bool removeIfExpired(const string& key);
     void cleanupExpiredBatch(size_t maxToClean);
-    void onExpiredFound();
+    // void onExpiredFound();
 };
 
 #endif // CACHE_H

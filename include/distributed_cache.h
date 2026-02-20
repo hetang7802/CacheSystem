@@ -180,11 +180,15 @@ private:
 
     // Failed nodes tracking
     unordered_set<string> failedNodes;
+    /**
+     * create cache for a node
+     */
+    shared_ptr<Cache> createNodeCache(const string& nodeId);
 
     /**
-     * Get or create cache for a node
+     * Get cache for a node
      */
-    shared_ptr<Cache> getOrCreateNodeCache(const string& nodeId);
+    shared_ptr<Cache> getNodeCache(const string& nodeId);
 
     /**
      * Get healthy nodes for a key (skips failed nodes)

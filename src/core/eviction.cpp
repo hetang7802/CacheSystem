@@ -54,7 +54,7 @@ void LRUEvictionPolicy::clear() {
 void LFUEvictionPolicy::onAccess(const string& key) {
     auto freqIt = keyFrequency.find(key);
     if (freqIt == keyFrequency.end()) {
-        return;  // Key not found, shouldn't happen
+        throw logic_error("on access called for key that is not present");
     }
     
     int oldFreq = freqIt->second;

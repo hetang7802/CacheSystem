@@ -94,12 +94,11 @@ optional<string> Cache::get(const string& key) {
     }
 
     if (it->second.isExpired()) {
-        auto it2 = store.find(key);
-        if (it2 != store.end() && it2->second.isExpired()) {
+        if (it != store.end() && it->second.isExpired()) {
             if (evictionPolicyImpl) {
                 evictionPolicyImpl->onRemove(key);
             }
-            store.erase(it2);
+            store.erase(it);
         }
         return nullopt;
     }
@@ -113,25 +112,14 @@ optional<string> Cache::get(const string& key) {
 }
 
 bool Cache::exists(const string& key) {
-    unique_lock<shared_mutex> lock(mutex);
+    shared_lock<shared_mutex> lock(mutex);
     
     auto it = store.find(key);
     if (it == store.end()) {
         return false;
     }
 
-    if (it->second.isExpired()) {
-        auto it2 = store.find(key);
-        if (it2 != store.end() && it2->second.isExpired()) {
-            if (evictionPolicyImpl) {
-                evictionPolicyImpl->onRemove(key);
-            }
-            store.erase(it2);
-        }
-        return false;
-    }
-
-    return true;
+    return !it->second.isExpired();
 }
 
 bool Cache::del(const string& key) {
@@ -211,14 +199,14 @@ unordered_map<string, Value> Cache::getAllData() const {
     return store;
 }
 
-bool Cache::removeIfExpired(const string& key) {
-    auto it = store.find(key);
-    if (it != store.end() && it->second.isExpired()) {
-        store.erase(it);
-        return true;
-    }
-    return false;
-}
+// bool Cache::removeIfExpired(const string& key) {
+//     auto it = store.find(key);
+//     if (it != store.end() && it->second.isExpired()) {
+//         store.erase(it);
+//         return true;
+//     }
+//     return false;
+// }
 
 void Cache::cleanupExpiredBatch(size_t maxToClean) {
     // Must be called with lock held
@@ -238,13 +226,13 @@ void Cache::cleanupExpiredBatch(size_t maxToClean) {
     }
 }
 
-void Cache::onExpiredFound() {
-    // Track expired encounters
-    size_t expired = expiredEncountered.fetch_add(1) + 1;
+// void Cache::onExpiredFound() {
+//     // Track expired encounters
+//     size_t expired = expiredEncountered.fetch_add(1) + 1;
     
-    // If we've encountered enough expired items, trigger batch cleanup
-    if (expired >= EXPIRY_THRESHOLD) {
-        expiredEncountered = 0;  // Reset counter
-        cleanupExpiredBatch(BATCH_CLEANUP_SIZE);
-    }
-}
+//     // If we've encountered enough expired items, trigger batch cleanup
+//     if (expired >= EXPIRY_THRESHOLD) {
+//         expiredEncountered = 0;  // Reset counter
+//         cleanupExpiredBatch(BATCH_CLEANUP_SIZE);
+//     }
+// }
