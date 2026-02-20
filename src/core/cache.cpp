@@ -334,3 +334,49 @@ unordered_map<string, Value> Cache::getAllData() const {
     
     return result;
 }
+
+optional<Cache::ValueWithTtl> Cache::getValueWithTtl(const string& key) {
+    size_t shardIdx = getShard(key);
+    Shard& shard = *shards[shardIdx];
+    
+    unique_lock<shared_mutex> lock(shard.mutex);
+    
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
+        return nullopt;
+    }
+
+    if (it->second.isExpired()) {
+        // Remove expired key
+        if (shard.evictionPolicy) {
+            try {
+                shard.evictionPolicy->onRemove(key);
+            } catch (...) {}
+        }
+        shard.store.erase(it);
+        return nullopt;
+    }
+
+    // Track access for eviction policies
+    if (shard.evictionPolicy) {
+        try {
+            shard.evictionPolicy->onAccess(key);
+        } catch (...) {}
+    }
+    
+    // Build result with TTL info
+    ValueWithTtl result;
+    result.data = it->second.data;
+    result.hasExpiry = it->second.hasExpiry;
+    
+    if (it->second.hasExpiry) {
+        auto remainingDuration = chrono::duration_cast<chrono::seconds>(
+            it->second.expiryTime - chrono::system_clock::now()
+        );
+        result.remainingTtl = max(0, static_cast<int>(remainingDuration.count()));
+    } else {
+        result.remainingTtl = nullopt;
+    }
+    
+    return result;
+}

@@ -1,6 +1,7 @@
 #include "distributed_cache.h"
 #include <mutex>
 #include <iostream>
+#include <assert.h>
 
 using namespace std;
 
@@ -11,7 +12,10 @@ DistributedCache::DistributedCache(int numVirtualNodes,
     : hashRing(numVirtualNodes),
       maxCapacityPerNode(maxCapacityPerNode),
       evictionPolicy(evictionPolicy),
-      replicationFactor(replicationFactor) {}
+      replicationFactor(replicationFactor) {
+    this->antiEntropyService = make_unique<AntiEntropyService>(this, chrono::seconds(30));
+    antiEntropyService->start(); // Starts automatically
+}
 
 bool DistributedCache::addNode(const string& nodeId) {
     unique_lock<shared_mutex> lock(mutex);
@@ -40,6 +44,8 @@ bool DistributedCache::removeNode(const string& nodeId) {
     // Remove cache instance from local map
     nodeCache.erase(nodeId);
     
+    bool allSuccess = true;
+
     for(auto &itr : dataToRedistribute){
         string key = itr.first;
         Value value = itr.second;
@@ -49,50 +55,48 @@ bool DistributedCache::removeNode(const string& nodeId) {
             continue;
         }
         
-        auto node = hashRing.findNode(key);
+        auto node = hashRing.findPrimaryNode(key, failedNodes);
         if (!node) {
-            cout << "WARNING : node removed but no node found for moving keys" << endl;
             return false;  // No nodes in cluster
         }
         
         // Write to primary node
         auto primaryCache = getNodeCache(node->id);
-        if(value.hasExpiry){
-            auto remainingDuration = chrono::duration_cast<chrono::seconds>(
-                value.expiryTime - chrono::system_clock::now()
-            );
-            int ttlSeconds = remainingDuration.count();
-            if (ttlSeconds > 0 && !primaryCache->setWithTtl(key, value.data, ttlSeconds)) {
-                return false;
-            }
-        }else{
-            if (!primaryCache->set(key, value.data)) {
-                return false;
-            }
+        if (!writeWithOptionalTtl(primaryCache, key, value)) {
+            // cout << "[ERROR] : write to node " << node->id << " failed" << endl;
+            allSuccess = false;
         }
         
         // Replicate to replica nodes
-        auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1);
+        auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1, failedNodes);
         
         for (const auto& replicaNode : replicas) {
             auto replicaCache = getNodeCache(replicaNode->id);
-            if(value.hasExpiry){
-                auto remainingDuration = chrono::duration_cast<chrono::seconds>(
-                    value.expiryTime - chrono::system_clock::now()
-                );
-                int ttlSeconds = remainingDuration.count();
-                if (ttlSeconds > 0 && !replicaCache->setWithTtl(key, value.data, ttlSeconds)) {
-                    return false;
-                }
-            }else{
-                if (!replicaCache->set(key, value.data)) {
-                    return false;
-                }
+            if (!writeWithOptionalTtl(replicaCache, key, value)) {
+                // cout << "[ERROR] : write to node " << replicaNode->id << " failed" << endl;
+                allSuccess = false;
             }
         }
     }
+    return allSuccess;
+}
 
-    return true;
+bool DistributedCache::writeWithOptionalTtl(shared_ptr<Cache> cache, 
+                                            const string& key, 
+                                            const Value& value) {
+    if (value.hasExpiry) {
+        auto remainingDuration = chrono::duration_cast<chrono::seconds>(
+            value.expiryTime - chrono::system_clock::now()
+        );
+        int ttlSeconds = remainingDuration.count();
+        if (ttlSeconds > 0) {
+            return cache->setWithTtl(key, value.data, ttlSeconds);
+        }
+        // TTL expired, don't write
+        return false;
+    } else {
+        return cache->set(key, value.data);
+    }
 }
 
 shared_ptr<Cache> DistributedCache::createNodeCache(const string& nodeId){
@@ -114,23 +118,24 @@ shared_ptr<Cache> DistributedCache::getNodeCache(const string& nodeId) {
 bool DistributedCache::set(const string& key, const string& value) {
     unique_lock<shared_mutex> lock(mutex);
     
-    // Get healthy nodes (skip failed ones)
-    auto healthyNodes = getHealthyNodes(key, replicationFactor);
-    if (healthyNodes.empty()) {
-        return false;  // No healthy nodes available
+    // Get first healthy node (primary or next healthy node if primary failed)
+    auto primaryNode = hashRing.findPrimaryNode(key, failedNodes);
+    if (!primaryNode) {
+        cout << "[ERROR] : No healthy nodes available" << endl;
+        return false;
     }
     
-    // Write to primary healthy node
-    auto primaryNode = healthyNodes[0];
     auto primaryCache = getNodeCache(primaryNode->id);
     if (!primaryCache->set(key, value)) {
         return false;
     }
     
-    // Replicate to remaining healthy replica nodes
-    for (size_t i = 1; i < healthyNodes.size(); ++i) {
-        auto replicaCache = getNodeCache(healthyNodes[i]->id);
-        replicaCache->set(key, value);  // Write to replica (ignore capacity errors for replicas)
+    // Get healthy replicas (automatically filters failed nodes)
+    auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1, failedNodes);
+    
+    for (const auto& replicaNode : replicas) {
+        auto replicaCache = getNodeCache(replicaNode->id);
+        replicaCache->set(key, value);
     }
     
     return true;
@@ -139,23 +144,24 @@ bool DistributedCache::set(const string& key, const string& value) {
 bool DistributedCache::setWithTtl(const string& key, const string& value, int ttlSeconds) {
     unique_lock<shared_mutex> lock(mutex);
     
-    // Get healthy nodes (skip failed ones)
-    auto healthyNodes = getHealthyNodes(key, replicationFactor);
-    if (healthyNodes.empty()) {
-        return false;  // No healthy nodes available
+    // Get first healthy node (primary or next healthy node if primary failed)
+    auto primaryNode = hashRing.findPrimaryNode(key, failedNodes);
+    if (!primaryNode) {
+        cout << "[ERROR] : No healthy nodes available" << endl;
+        return false;
     }
     
-    // Write to primary healthy node with TTL
-    auto primaryNode = healthyNodes[0];
     auto primaryCache = getNodeCache(primaryNode->id);
     if (!primaryCache->setWithTtl(key, value, ttlSeconds)) {
         return false;
     }
     
-    // Replicate to remaining healthy replica nodes with same TTL
-    for (size_t i = 1; i < healthyNodes.size(); ++i) {
-        auto replicaCache = getNodeCache(healthyNodes[i]->id);
-        replicaCache->setWithTtl(key, value, ttlSeconds);  // Write to replica
+    // Get healthy replicas (automatically filters failed nodes)
+    auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1, failedNodes);
+    
+    for (const auto& replicaNode : replicas) {
+        auto replicaCache = getNodeCache(replicaNode->id);
+        replicaCache->setWithTtl(key, value, ttlSeconds);
     }
     
     return true;
@@ -164,115 +170,55 @@ bool DistributedCache::setWithTtl(const string& key, const string& value, int tt
 optional<string> DistributedCache::get(const string& key) {
     shared_lock<shared_mutex> lock(mutex);
     
-    // Step 1: Check primary node first
-    auto primaryNode = hashRing.findNode(key);
-    bool primaryFailed = false;
-    
-    if (primaryNode) {
-        if (failedNodes.find(primaryNode->id) == failedNodes.end()) {
-            // Primary is healthy - check it
-            auto primaryCache = getNodeCache(primaryNode->id);
-            auto value = primaryCache->get(key);
-            if (value) {
-                return value;  // Found on primary
-            }
-            // Primary is healthy but key not found - this is a cache miss, return nullopt
-            return nullopt;
-        } else {
-            // Primary is failed - need to search other nodes
-            primaryFailed = true;
-        }
-    } else {
-        // No primary node (empty cluster)
-        return nullopt;
+    // Automatically gets first healthy node (primary or first healthy replica)
+    auto healthyNode = hashRing.findPrimaryNode(key, failedNodes);
+    if (!healthyNode) {
+        return nullopt;  // All nodes for this key are failed
     }
     
-    // Step 2: Check replica nodes (only if primary failed)
-    if (primaryFailed) {
-        auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1);
-        for (const auto& replicaNode : replicas) {
-            // Skip failed nodes
-            if (failedNodes.find(replicaNode->id) != failedNodes.end()) {
-                continue;
-            }
-            
-            auto replicaCache = getNodeCache(replicaNode->id);
-            auto value = replicaCache->get(key);
-            if (value) {
-                return value;  // Found on replica
-            }
-        }
-    }
-    
-    return nullopt;  // Not found anywhere
+    auto cache = getNodeCache(healthyNode->id);
+    return cache->get(key);
 }
 
 bool DistributedCache::exists(const string& key) {
     shared_lock<shared_mutex> lock(mutex);
-    
-    // Step 1: Check primary node first
-    auto primaryNode = hashRing.findNode(key);
-    bool primaryFailed = false;
-    
-    if (primaryNode) {
-        if (failedNodes.find(primaryNode->id) == failedNodes.end()) {
-            // Primary is healthy - check it
-            auto primaryCache = getNodeCache(primaryNode->id);
-            if (primaryCache->exists(key)) {
-                return true;  // Found on primary
-            }
-            // Primary is healthy but key not found - this is a cache miss, return false
-            return false;
-        } else {
-            // Primary is failed - need to search other nodes
-            primaryFailed = true;
-        }
-    } else {
-        // No primary node (empty cluster)
-        cout << "WARNING: cluster doesn't contain any nodes" << endl;
+        
+    // Get first healthy node that should have this key
+    auto healthyNode = hashRing.findPrimaryNode(key, failedNodes);
+    if (!healthyNode) {
         return false;
     }
     
-    // Step 2: Check replica nodes (only if primary failed)
-    if (primaryFailed) {
-        auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1);
-        for (const auto& replicaNode : replicas) {
-            // Skip failed nodes
-            if (failedNodes.find(replicaNode->id) != failedNodes.end()) {
-                continue;
-            }
-            
-            auto replicaCache = getNodeCache(replicaNode->id);
-            if (replicaCache->exists(key)) {
-                return true;  // Found on replica
-            }
-        }
-    }
-    
-    return false;  // Not found anywhere
+    auto cache = getNodeCache(healthyNode->id);
+    return cache->exists(key);
 }
 
 // todo : review this 
-bool DistributedCache::del(const string& key) {
+void DistributedCache::del(const string& key) {
     unique_lock<shared_mutex> lock(mutex);
     
-    // Get healthy nodes (skip failed ones)
-    auto healthyNodes = getHealthyNodes(key, replicationFactor);
-    if (healthyNodes.empty()) {
-        return false;  // No healthy nodes available
+    // Get all healthy nodes that should have this key
+    auto primaryNode = hashRing.findPrimaryNode(key, failedNodes);
+    if (!primaryNode) {
+        return ;  // No healthy nodes
     }
     
-    bool deleted = false;
+    // Delete from primary
+    auto primaryCache = getNodeCache(primaryNode->id);
+    if (!primaryCache->del(key)) {
+        cout << "[WARNING] : problem occured while deleting " << key << " from " << primaryNode->id << endl;
+    }
     
-    // Delete from all healthy nodes to keep consistency
-    for (const auto& node : healthyNodes) {
-        auto cache = getNodeCache(node->id);
-        if (cache->del(key)) {
-            deleted = true;  // At least one deletion succeeded
+    // Delete from replicas
+    auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1, failedNodes);
+    for (const auto& replica : replicas) {
+        auto cache = getNodeCache(replica->id);
+        if (!cache->del(key)) {
+            cout << "[WARNING] : problem occured while deleting " << key << " from " << primaryNode->id << endl;
         }
     }
     
-    return deleted;
+    return ;
 }
 
 size_t DistributedCache::size() {
@@ -296,7 +242,7 @@ void DistributedCache::clear() {
 string DistributedCache::findKeyNode(const string& key) const {
     shared_lock<shared_mutex> lock(mutex);
     
-    auto node = hashRing.findNode(key);
+    auto node = hashRing.findPrimaryNode(key, failedNodes);
     return node ? node->id : "";
 }
 
@@ -371,53 +317,157 @@ vector<string> DistributedCache::getFailedNodes() const {
     return result;
 }
 
-vector<shared_ptr<Node>> DistributedCache::getHealthyNodes(const string& key, size_t maxNodes) const {
-    vector<shared_ptr<Node>> healthyNodes;
+vector<string> DistributedCache::getKeysOnNode(const string& nodeId) const {
+    shared_lock<shared_mutex> lock(mutex);
     
-    // Get primary node
-    auto primaryNode = hashRing.findNode(key);
-    if (!primaryNode) {
-        return healthyNodes;  // No nodes in cluster
+    vector<string> keys;
+    if(failedNodes.find(nodeId)!=failedNodes.end())return keys;
+    
+    auto it = nodeCache.find(nodeId);
+    if (it == nodeCache.end()) {
+        return keys;
     }
     
-    // Strategy: Get replica nodes in deterministic ring order
-    // This ensures we only check nodes that SHOULD have the data based on consistent hashing
-    // We request enough replicas to cover the maxNodes we want to check
+    // Get all data from this node's cache
+    auto nodeData = it->second->getAllData();
     
-    // Get replica nodes in ring order (deterministic)
-    // Request enough replicas to fill maxNodes (accounting for primary)
-    // Request a bit more to account for failed nodes in the list
-    size_t replicasToRequest = maxNodes * 2;  // Request 2x to account for failed nodes
-    if (replicasToRequest > hashRing.nodeCount()) {
-        replicasToRequest = hashRing.nodeCount();
-    }
-    auto allReplicas = hashRing.getReplicaNodes(key, replicasToRequest);
-    
-    // Add primary if healthy (should be first)
-    if (failedNodes.find(primaryNode->id) == failedNodes.end()) {
-        healthyNodes.push_back(primaryNode);
+    for (const auto& [key, value] : nodeData) {
+        // Skip expired keys
+        if (!value.isExpired()) {
+            keys.push_back(key);
+        }
     }
     
-    // Add healthy replicas in ring order (deterministic)
-    for (const auto& replica : allReplicas) {
-        if (healthyNodes.size() >= maxNodes) {
-            break;
+    return keys;
+}
+
+size_t DistributedCache::getActualReplicationCount(const string& key) const {
+    shared_lock<shared_mutex> lock(mutex);
+    
+    size_t count = 0;
+    
+    // Check all nodes to see which ones have this key
+    for (const auto& [nodeId, cache] : nodeCache) {
+        // Skip failed nodes
+        if (failedNodes.find(nodeId) != failedNodes.end()) {
+            continue;
         }
         
-        // Skip if already added (primary might be in replicas list)
-        bool alreadyAdded = false;
-        for (const auto& existing : healthyNodes) {
-            if (existing->id == replica->id) {
-                alreadyAdded = true;
-                break;
+        if (cache->exists(key)) {
+            count++;
+        }
+    }
+    
+    return count;
+}
+
+vector<string> DistributedCache::getAllHealthyNodes() const {
+    shared_lock<shared_mutex> lock(mutex);
+    vector<string> allNodes = getAllNodes();
+    vector<string> healthyNodes ;
+    for(string node: allNodes){
+        if(failedNodes.find(node)==failedNodes.end()){
+            healthyNodes.push_back(node);
+        }
+    }
+    return hashRing.getAllNodes();
+}
+
+bool DistributedCache::repairKey(const string& key) {
+    unique_lock<shared_mutex> lock(mutex);
+    
+    // Find a healthy node that has this key
+    auto expectedNodes = getExpectedNodesForKey(key, lock);
+
+    
+    // Find a healthy source node with the data
+    optional<Cache::ValueWithTtl> valueWithTtl;
+    string sourceNodeId = "";
+    
+    for (const auto& nodeId : expectedNodes) {
+        if (failedNodes.find(nodeId) != failedNodes.end()) {
+            continue;  // Skip failed nodes
+        }
+        auto cacheIt = nodeCache.find(nodeId);
+        if (cacheIt != nodeCache.end()) {
+            valueWithTtl = cacheIt->second->getValueWithTtl(key);
+            if (valueWithTtl) {
+                sourceNodeId = nodeId;
+                break;  // Found it!
             }
         }
-        
-        // Add if not already added and not failed
-        if (!alreadyAdded && failedNodes.find(replica->id) == failedNodes.end()) {
-            healthyNodes.push_back(replica);
-        }
+    }
+    // cout << "[DEBUG] : source node " << sourceNodeId << endl;
+    
+    if (!valueWithTtl) {
+        // No healthy node has this key - data is lost
+        // cout << "[DEBUG] : no healthy node found iwth the key" << key << endl;
+        return false;
     }
     
-    return healthyNodes;
+    // Replicate to all expected nodes that don't have it
+    bool success = true;
+    
+    for (const auto& nodeId : expectedNodes) {
+        // cout << "[DEBUG] : trying to replicate in " << nodeId << endl;
+
+        if(nodeId == sourceNodeId || failedNodes.find(nodeId)!=failedNodes.end()) {
+            // cout << "[DEBUG] : node either source or failed " << endl;
+            continue;
+        }
+        // cout << "[DEBUG] : trying to replicate in " << nodeId << endl;
+        
+        auto targetCache = getNodeCache(nodeId);
+        
+        // Check if already has the key
+        if (targetCache->exists(key)) {
+            // cout << "[DEBUG] : key already exists in " << nodeId << endl;
+            continue;
+        }
+        
+        // Replicate with TTL if applicable
+        // todo : replace this with writeWithOptionalTtl
+        if (valueWithTtl->hasExpiry && valueWithTtl->remainingTtl && *valueWithTtl->remainingTtl > 0) {
+            // cout << "[DEBUG] : setting with ttl to " << nodeId << endl;
+            if(!targetCache->setWithTtl(key, valueWithTtl->data, *valueWithTtl->remainingTtl)){
+                success = false;
+            }
+        } else {
+            // cout << "[DEBUG] : setting without ttl to " << nodeId << endl;
+            if(!targetCache->set(key, valueWithTtl->data)){
+                success = false;
+            }
+        }
+    }
+    if(success){
+        // cout << "[DEBUG] : repair successfull for key " << key << endl; 
+    }else{
+        // cout << "[DEBUG] : could not duplicate key to other nodes " << key << endl;
+    } 
+    return success;
+}
+
+
+vector<string> DistributedCache::getExpectedNodesForKey(const string& key, 
+        unique_lock<shared_mutex>& heldLock) const {
+        
+    assert(heldLock.owns_lock());
+    
+    vector<string> expectedNodes;
+    
+    // Get primary node
+    auto primaryNode = hashRing.findPrimaryNode(key, failedNodes);
+    if (!primaryNode) {
+        return expectedNodes;
+    }
+    
+    expectedNodes.push_back(primaryNode->id);
+    
+    // Get replica nodes
+    auto replicas = hashRing.getReplicaNodes(key, replicationFactor - 1, failedNodes);
+    for (const auto& replica : replicas) {
+        expectedNodes.push_back(replica->id);
+    }
+    
+    return expectedNodes;
 }
