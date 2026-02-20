@@ -94,12 +94,10 @@ optional<string> Cache::get(const string& key) {
     }
 
     if (it->second.isExpired()) {
-        if (it != store.end() && it->second.isExpired()) {
-            if (evictionPolicyImpl) {
-                evictionPolicyImpl->onRemove(key);
-            }
-            store.erase(it);
+        if (evictionPolicyImpl) {
+            evictionPolicyImpl->onRemove(key);
         }
+        store.erase(it);
         return nullopt;
     }
 
