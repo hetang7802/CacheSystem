@@ -3,12 +3,12 @@
 
 #include <unordered_map>
 #include <string>
-#include <memory>
 #include <chrono>
 #include <shared_mutex>
 #include <optional>
 #include "eviction.h"
 #include <atomic>
+#include <vector>
 
 using namespace std;
 
@@ -41,6 +41,7 @@ struct Value {
  * In-memory cache with TTL support, eviction policies, and thread safety
  * Phase 1: Core cache engine
  * Phase 2: Eviction policies (LRU/LFU)
+ * Phase 3: Lock sharding for better concurrency
  */
 class Cache {
 public:
@@ -50,6 +51,9 @@ public:
         LRU,   // Least Recently Used
         LFU    // Least Frequently Used
     };
+
+    // Number of shards for lock sharding (reduces contention)
+    static constexpr size_t NUM_SHARDS = 16;
 
     /**
      * Default constructor (no eviction, unlimited size)
@@ -131,7 +135,7 @@ public:
      * Get eviction stats
      * @return Number of keys that have been evicted
      */
-    size_t evictionCount() const { return evictedCount; }
+    // size_t evictionCount() const { return evictedCount;}
 
     /**
      * Clean up expired keys (internal housekeeping)
@@ -147,35 +151,40 @@ public:
 
 
 private:
-    unordered_map<string, Value> store;
-    size_t maxCapacity;
-    size_t evictedCount;
-    mutable shared_mutex mutex;
+    /**
+     * Shard structure - each shard has its own lock and data to reduce contention
+     */
+    struct Shard {
+        mutable shared_mutex mutex;
+        unordered_map<string, Value> store;
+        unique_ptr<EvictionPolicy> evictionPolicy;
+        size_t evictedCount;
+        size_t shardCapacity;
+    };
     
-    // Eviction policy
-    unique_ptr<EvictionPolicy> evictionPolicyImpl;
-
-    // Lazy expiration tracking
-    atomic<size_t> approximateSize{0};
-    atomic<size_t> expiredEncountered{0};
-    static const size_t EXPIRY_THRESHOLD = 100;  // Trigger cleanup after N expired items
-    static const size_t BATCH_CLEANUP_SIZE = 50; // Clean up to 50 items per batch
-
+    vector<unique_ptr<Shard>> shards;
+    size_t maxCapacity;
+    EvictionType evictionPolicyType;
 
     /**
-     * Check and remove if expired (must be called with lock held)
-     * @param key The key to check
-     * @return true if key was removed due to expiry
+     * Get shard index for a key (hash-based distribution)
      */
-    // bool removeIfExpired(const string& key);
+    size_t getShard(const string& key) const {
+        hash<string> hasher;
+        return hasher(key) % NUM_SHARDS;
+    }
 
     /**
-     * Enforce capacity limits (must be called with lock held)
-     * Evicts keys according to policy until under capacity
+     * Create eviction policy instance
      */
-    void enforceCapacity();
+    unique_ptr<EvictionPolicy> createEvictionPolicy(EvictionType type);
+
+    /**
+     * Enforce capacity for a specific shard (must be called with shard lock held)
+     */
+    void enforceCapacityShard(size_t shardIdx);
+    
     void cleanupExpiredBatch(size_t maxToClean);
-    // void onExpiredFound();
 };
 
 #endif // CACHE_H

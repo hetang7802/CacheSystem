@@ -52,6 +52,7 @@ void testLocalCacheConcurrency() {
             
             // Get operation (read what we just wrote)
             auto result = cache.get(key);
+            // cout << "result " << key << " " << result.value_or(0) << endl;
             if (result && result.value() == value) {
                 successCount++;
             } else {
@@ -339,52 +340,56 @@ void testDistributedCacheWithFailures() {
 void testStressTest() {
     lock_guard g(mTest);
     cout << "\n" << string(60, '=') << endl;
-    cout << "TEST 6: STRESS TEST - HIGH CONCURRENCY" << endl;
+    cout << "TEST 4: DISTRIBUTED CACHE - CONCURRENT SET/GET" << endl;
     cout << string(60, '=') << endl;
 
-    Cache cache(Cache::EvictionType::LFU, 2000);
-    int numThreads = 10;
-    int operationsPerThread = 200;
-    
-    cout << "\nStress testing with " << numThreads << " threads" << endl;
-    cout << "Each thread performing " << operationsPerThread << " operations" << endl;
+    DistributedCache cache(150, 500, Cache::EvictionType::LRU, 3);
+    int numNodes = 10;
+    int numThreads = 5;
+    int totalOperations = 100000;
+    int operationsPerThread = totalOperations/numThreads;
 
-    atomic<int> totalOps(0);
-    atomic<int> errors(0);
+    // Add nodes to cluster
+    cout << "\nAdding " << numNodes << " nodes to cluster..." << endl;
+    for (int i = 0; i < numNodes; ++i) {
+        cache.addNode("node_" + to_string(i));
+    }
+    cout << "Cluster ready with nodes: ";
+    for (const auto& node : cache.getAllNodes()) {
+        cout << node << " ";
+    }
+    cout << endl;
+
+    atomic<int> successCount(0);
+    atomic<int> failureCount(0);
+
+    cout << "\nSpawning " << numThreads << " threads for concurrent operations..." << endl;
 
     auto startTime = chrono::high_resolution_clock::now();
 
-    auto stressWork = [&](int threadId) {
-        mt19937 gen(threadId + chrono::system_clock::now().time_since_epoch().count());
-        uniform_int_distribution<> opType(0, 2);  // 0: SET, 1: GET, 2: DEL
-        
+    auto threadWork = [&](int threadId) {
         for (int i = 0; i < operationsPerThread; ++i) {
-            string key = "stress_" + to_string(threadId) + "_" + to_string(i);
-            string value = "v_" + to_string(i);
+            string key = "dist_key_" + to_string(threadId) + "_" + to_string(i);
+            string value = "dist_value_" + to_string(i);
             
-            int op = opType(gen);
-            try {
-                switch (op) {
-                    case 0:  // SET
-                        cache.set(key, value);
-                        break;
-                    case 1:  // GET
-                        cache.get(key);
-                        break;
-                    case 2:  // DEL
-                        cache.del(key);
-                        break;
-                }
-                totalOps++;
-            } catch (...) {
-                errors++;
+            if (cache.set(key, value)) {
+                successCount++;
+            } else {
+                failureCount++;
+            }
+            
+            auto result = cache.get(key);
+            if (result && result.value() == value) {
+                successCount++;
+            } else {
+                failureCount++;
             }
         }
     };
 
     vector<thread> threads;
     for (int i = 0; i < numThreads; ++i) {
-        threads.emplace_back(stressWork, i);
+        threads.emplace_back(threadWork, i);
     }
 
     for (auto& t : threads) {
@@ -393,14 +398,17 @@ void testStressTest() {
 
     auto endTime = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::milliseconds>(endTime - startTime);
-    double throughput = (totalOps.load() * 1000.0) / duration.count();
 
-    cout << "  Stress test completed!" << endl;
-    cout << "  Total operations: " << totalOps << endl;
-    cout << "  Errors: " << errors << endl;
-    cout << "  Cache size: " << cache.size() << endl;
+    cout << "  Distributed cache test completed!" << endl;
+    cout << "  Total items in cluster: " << cache.size() << endl;
+    cout << "  Successful operations: " << successCount << endl;
+    cout << "  Failed operations: " << failureCount << endl;
     cout << "  Total Time: " << duration.count() << " ms" << endl;
-    cout << "  Throughput: " << fixed << setprecision(2) << throughput << " ops/sec" << endl;
+    
+    cout << "\nNode distribution:" << endl;
+    for (const auto& node : cache.getAllNodes()) {
+        cout << "  " << node << ": " << cache.getNodeSize(node) << " items" << endl;
+    }
 }
 
 int main() {
@@ -410,12 +418,12 @@ int main() {
 
     try {
         // Run all tests
-        // testLocalCacheConcurrency();
-        // testLocalCacheWithTTL();
-        // testLocalCacheDeleteAndExists();
+        testLocalCacheConcurrency();
+        testLocalCacheWithTTL();
+        testLocalCacheDeleteAndExists();
         testDistributedCacheConcurrency();
-        // testDistributedCacheWithFailures();
-        // testStressTest();
+        testDistributedCacheWithFailures();
+        testStressTest();
 
         cout << "\n" << string(60, '*') << endl;
         cout << "ALL TESTS COMPLETED SUCCESSFULLY!" << endl;
