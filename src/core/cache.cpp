@@ -1,119 +1,198 @@
 #include "cache.h"
 #include <algorithm>
 #include <mutex>
+#include <memory>
 #include <iostream>
 
 using namespace std;
 
+// ============== CONSTRUCTOR & DESTRUCTOR ==============
+
 Cache::Cache() 
-    : maxCapacity(0), evictedCount(0), evictionPolicyImpl(nullptr) {}
+    : maxCapacity(0), evictionPolicyType(EvictionType::NONE) {
+    // Initialize all shards with unique_ptr
+    for (size_t i = 0; i < NUM_SHARDS; i++) {
+        auto shard = make_unique<Shard>();
+        shard->evictedCount = 0;
+        shard->shardCapacity = 0;
+        shard->evictionPolicy = nullptr;
+        shards.push_back(move(shard));
+    }
+}
 
 Cache::Cache(EvictionType policyType, size_t maxCapacityVal)
-    : maxCapacity(maxCapacityVal), evictedCount(0) {
-    switch (policyType) {
-        case EvictionType::LRU:
-            evictionPolicyImpl = make_unique<LRUEvictionPolicy>();
-            break;
-        case EvictionType::LFU:
-            evictionPolicyImpl = make_unique<LFUEvictionPolicy>();
-            break;
-        default:
-            evictionPolicyImpl = nullptr;
+    : maxCapacity(maxCapacityVal), evictionPolicyType(policyType) {
+    
+    // Initialize all shards with their share of capacity
+    size_t capacityPerShard = (maxCapacityVal == 0) ? 0 : (maxCapacityVal / NUM_SHARDS);
+    
+    for (size_t i = 0; i < NUM_SHARDS; i++) {
+        auto shard = make_unique<Shard>();
+        shard->evictedCount = 0;
+        shard->shardCapacity = capacityPerShard;
+        shard->evictionPolicy = createEvictionPolicy(policyType);
+        shards.push_back(move(shard));
     }
 }
 
 Cache::~Cache() {}
 
+unique_ptr<EvictionPolicy> Cache::createEvictionPolicy(EvictionType type) {
+    switch (type) {
+        case EvictionType::LRU:
+            return make_unique<LRUEvictionPolicy>();
+        case EvictionType::LFU:
+            return make_unique<LFUEvictionPolicy>();
+        default:
+            return nullptr;
+    }
+}
+
+// ============== CORE OPERATIONS ==============
+
 bool Cache::set(const string& key, const string& value) {
-    unique_lock<shared_mutex> lock(mutex);
+    size_t shardIdx = getShard(key);
+    Shard& shard = *shards[shardIdx];
     
-    // If key exists, we're updating (not adding)
-    bool keyExists = store.find(key) != store.end();
+    unique_lock<shared_mutex> lock(shard.mutex);
     
-    if (!keyExists && maxCapacity > 0 && store.size() >= maxCapacity) {
-        enforceCapacity();
+    // Check if key exists
+    bool keyExists = shard.store.find(key) != shard.store.end();
+    
+    // Check capacity before new insertion
+    if (!keyExists && shard.shardCapacity > 0 && shard.store.size() >= shard.shardCapacity) {
+        // Need to enforce capacity
+        if (shard.evictionPolicy) {
+            while (shard.store.size() >= shard.shardCapacity) {
+                try {
+                    string keyToEvict = shard.evictionPolicy->evict();
+                    if (keyToEvict.empty()) break;
+                    
+                    auto it = shard.store.find(keyToEvict);
+                    if (it != shard.store.end()) {
+                        shard.store.erase(it);
+                        shard.evictedCount++;
+                    } else {
+                        break;
+                    }
+                } catch (...) {
+                    break;
+                }
+            }
+        }
         
         // If still full after eviction, fail
-        if (store.size() >= maxCapacity) {
+        if (shard.store.size() >= shard.shardCapacity) {
             return false;
         }
     }
     
-    // If updating existing key, tell eviction policy
-    if (keyExists) {
-        if (evictionPolicyImpl) {
-            evictionPolicyImpl->onAccess(key);
-        }
-    } else {
-        // New key
-        if (evictionPolicyImpl) {
-            evictionPolicyImpl->onAdd(key);
+    // Track in eviction policy
+    if (shard.evictionPolicy) {
+        if (keyExists) {
+            try {
+                shard.evictionPolicy->onAccess(key);
+            } catch (...) {}
+        } else {
+            try {
+                shard.evictionPolicy->onAdd(key);
+            } catch (...) {}
         }
     }
     
-    store[key] = Value(value);
+    shard.store[key] = Value(value);
     return true;
 }
 
-bool Cache::setWithTtl(const string& key, const string& value, 
-                         int ttlSeconds) {
-    unique_lock<shared_mutex> lock(mutex);
+bool Cache::setWithTtl(const string& key, const string& value, int ttlSeconds) {
+    size_t shardIdx = getShard(key);
+    Shard& shard = *shards[shardIdx];
     
-    bool keyExists = store.find(key) != store.end();
+    unique_lock<shared_mutex> lock(shard.mutex);
     
-    if (!keyExists && maxCapacity > 0 && store.size() >= maxCapacity) {
-        enforceCapacity();
+    bool keyExists = shard.store.find(key) != shard.store.end();
+    
+    if (!keyExists && shard.shardCapacity > 0 && shard.store.size() >= shard.shardCapacity) {
+        if (shard.evictionPolicy) {
+            while (shard.store.size() >= shard.shardCapacity) {
+                try {
+                    string keyToEvict = shard.evictionPolicy->evict();
+                    if (keyToEvict.empty()) break;
+                    
+                    auto it = shard.store.find(keyToEvict);
+                    if (it != shard.store.end()) {
+                        shard.store.erase(it);
+                        shard.evictedCount++;
+                    } else {
+                        break;
+                    }
+                } catch (...) {
+                    break;
+                }
+            }
+        }
         
-        if (store.size() >= maxCapacity) {
+        if (shard.store.size() >= shard.shardCapacity) {
             return false;
         }
     }
     
-    if (keyExists) {
-        if (evictionPolicyImpl) {
-            evictionPolicyImpl->onAccess(key);
-        }
-    } else {
-        if (evictionPolicyImpl) {
-            evictionPolicyImpl->onAdd(key);
+    if (shard.evictionPolicy) {
+        if (keyExists) {
+            try {
+                shard.evictionPolicy->onAccess(key);
+            } catch (...) {}
+        } else {
+            try {
+                shard.evictionPolicy->onAdd(key);
+            } catch (...) {}
         }
     }
     
-    auto expiryTime = chrono::system_clock::now() + 
-                      chrono::seconds(ttlSeconds);
-    store[key] = Value(value, expiryTime);
+    auto expiryTime = chrono::system_clock::now() + chrono::seconds(ttlSeconds);
+    shard.store[key] = Value(value, expiryTime);
     return true;
 }
 
 optional<string> Cache::get(const string& key) {
-    unique_lock<shared_mutex> lock(mutex);
+    size_t shardIdx = getShard(key);
+    Shard& shard = *shards[shardIdx];
     
-    auto it = store.find(key);
-    if (it == store.end()) {
+    unique_lock<shared_mutex> lock(shard.mutex);
+    
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
         return nullopt;
     }
 
     if (it->second.isExpired()) {
-        if (evictionPolicyImpl) {
-            evictionPolicyImpl->onRemove(key);
+        if (shard.evictionPolicy) {
+            try {
+                shard.evictionPolicy->onRemove(key);
+            } catch (...) {}
         }
-        store.erase(it);
+        shard.store.erase(it);
         return nullopt;
     }
 
     // Track access for eviction policies
-    if (evictionPolicyImpl) {
-        evictionPolicyImpl->onAccess(key);
+    if (shard.evictionPolicy) {
+        try {
+            shard.evictionPolicy->onAccess(key);
+        } catch (...) {}
     }
     
     return it->second.data;
 }
 
 bool Cache::exists(const string& key) {
-    shared_lock<shared_mutex> lock(mutex);
+    size_t shardIdx = getShard(key);
+    Shard& shard = *shards[shardIdx];
     
-    auto it = store.find(key);
-    if (it == store.end()) {
+    shared_lock<shared_mutex> lock(shard.mutex);
+    
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
         return false;
     }
 
@@ -121,116 +200,137 @@ bool Cache::exists(const string& key) {
 }
 
 bool Cache::del(const string& key) {
-    unique_lock<shared_mutex> lock(mutex);
-    if (evictionPolicyImpl) {
-        evictionPolicyImpl->onRemove(key);
+    size_t shardIdx = getShard(key);
+    Shard& shard = *shards[shardIdx];
+    
+    unique_lock<shared_mutex> lock(shard.mutex);
+    
+    if (shard.evictionPolicy) {
+        try {
+            shard.evictionPolicy->onRemove(key);
+        } catch (...) {}
     }
-    return store.erase(key) > 0;
+    
+    return shard.store.erase(key) > 0;
 }
 
-// todo : iterating 
+// ============== UTILITY FUNCTIONS ==============
+
 size_t Cache::size() {
-    // Return approximate size without locking or iterating
-    // This is fast but may be slightly inaccurate due to undetected expired items
-    return approximateSize.load();
+    size_t totalSize = 0;
+    for (size_t i = 0; i < NUM_SHARDS; i++) {
+        shared_lock<shared_mutex> lock(shards[i]->mutex);
+        totalSize += shards[i]->store.size();
+    }
+    return totalSize;
 }
 
 void Cache::clear() {
-    unique_lock<shared_mutex> lock(mutex);
-    if (evictionPolicyImpl) {
-        evictionPolicyImpl->clear();
+    for (size_t i = 0; i < NUM_SHARDS; i++) {
+        unique_lock<shared_mutex> lock(shards[i]->mutex);
+        shards[i]->store.clear();
+        shards[i]->evictedCount = 0;
+        if (shards[i]->evictionPolicy) {
+            shards[i]->evictionPolicy->clear();
+        }
     }
-    store.clear();
-    evictedCount = 0;
 }
 
 string Cache::evictionPolicy() const {
-    if (!evictionPolicyImpl) {
-        return "NONE";
+    switch (evictionPolicyType) {
+        case EvictionType::LRU:
+            return "LRU";
+        case EvictionType::LFU:
+            return "LFU";
+        default:
+            return "NONE";
     }
-    return evictionPolicyImpl->policyName();
 }
 
-void Cache::enforceCapacity() {
-    // Must be called with lock held
-    if (!evictionPolicyImpl || maxCapacity == 0) {
+void Cache::enforceCapacityShard(size_t shardIdx) {
+    Shard& shard = *shards[shardIdx];
+    
+    unique_lock<shared_mutex> lock(shard.mutex);
+    
+    if (!shard.evictionPolicy || shard.shardCapacity == 0) {
         return;
     }
     
-    while (store.size() >= maxCapacity) {
-        string keyToEvict = evictionPolicyImpl->evict();
-        if (keyToEvict.empty()) {
-            break;  // Nothing more to evict
-        }
-        
-        auto it = store.find(keyToEvict);
-        if (it != store.end()) {
-            store.erase(it);
-            evictedCount++;
+    while (shard.store.size() >= shard.shardCapacity) {
+        try {
+            string keyToEvict = shard.evictionPolicy->evict();
+            if (keyToEvict.empty()) {
+                break;
+            }
+            
+            auto it = shard.store.find(keyToEvict);
+            if (it != shard.store.end()) {
+                shard.store.erase(it);
+                shard.evictedCount++;
+            } else {
+                break;
+            }
+        } catch (...) {
+            break;
         }
     }
 }
 
-// todo : only called by cli should be removed
 size_t Cache::cleanupExpired() {
-    unique_lock<shared_mutex> lock(mutex);
     size_t removedCount = 0;
     
-    for (auto it = store.begin(); it != store.end();) {
-        if (it->second.isExpired()) {
-            if (evictionPolicyImpl) {
-                evictionPolicyImpl->onRemove(it->first);
+    for (size_t i = 0; i < NUM_SHARDS; i++) {
+        unique_lock<shared_mutex> lock(shards[i]->mutex);
+        
+        for (auto it = shards[i]->store.begin(); it != shards[i]->store.end();) {
+            if (it->second.isExpired()) {
+                if (shards[i]->evictionPolicy) {
+                    try {
+                        shards[i]->evictionPolicy->onRemove(it->first);
+                    } catch (...) {}
+                }
+                it = shards[i]->store.erase(it);
+                removedCount++;
+            } else {
+                ++it;
             }
-            it = store.erase(it);
-            removedCount++;
-        } else {
-            ++it;
         }
     }
     
     return removedCount;
 }
 
-unordered_map<string, Value> Cache::getAllData() const {
-    shared_lock<shared_mutex> lock(mutex);
-    
-    return store;
-}
-
-// bool Cache::removeIfExpired(const string& key) {
-//     auto it = store.find(key);
-//     if (it != store.end() && it->second.isExpired()) {
-//         store.erase(it);
-//         return true;
-//     }
-//     return false;
-// }
-
 void Cache::cleanupExpiredBatch(size_t maxToClean) {
-    // Must be called with lock held
     size_t cleaned = 0;
     
-    for (auto it = store.begin(); it != store.end() && cleaned < maxToClean;) {
-        if (it->second.isExpired()) {
-            if (evictionPolicyImpl) {
-                evictionPolicyImpl->onRemove(it->first);
+    for (size_t i = 0; i < NUM_SHARDS && cleaned < maxToClean; i++) {
+        unique_lock<shared_mutex> lock(shards[i]->mutex);
+        
+        for (auto it = shards[i]->store.begin(); it != shards[i]->store.end() && cleaned < maxToClean;) {
+            if (it->second.isExpired()) {
+                if (shards[i]->evictionPolicy) {
+                    try {
+                        shards[i]->evictionPolicy->onRemove(it->first);
+                    } catch (...) {}
+                }
+                it = shards[i]->store.erase(it);
+                cleaned++;
+            } else {
+                ++it;
             }
-            it = store.erase(it);
-            approximateSize--;
-            cleaned++;
-        } else {
-            ++it;
         }
     }
 }
 
-// void Cache::onExpiredFound() {
-//     // Track expired encounters
-//     size_t expired = expiredEncountered.fetch_add(1) + 1;
+unordered_map<string, Value> Cache::getAllData() const {
+    unordered_map<string, Value> result;
     
-//     // If we've encountered enough expired items, trigger batch cleanup
-//     if (expired >= EXPIRY_THRESHOLD) {
-//         expiredEncountered = 0;  // Reset counter
-//         cleanupExpiredBatch(BATCH_CLEANUP_SIZE);
-//     }
-// }
+    for (size_t i = 0; i < NUM_SHARDS; i++) {
+        shared_lock<shared_mutex> lock(shards[i]->mutex);
+        for (const auto& pair : shards[i]->store) {
+            result[pair.first] = pair.second;
+        }
+    }
+    
+    return result;
+}
