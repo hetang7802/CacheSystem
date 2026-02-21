@@ -498,12 +498,12 @@ int main() {
 
     try {
         // Run all tests
-        // testLocalCacheConcurrency();
-        // testLocalCacheWithTTL();
-        // testLocalCacheDeleteAndExists();
-        // testDistributedCacheConcurrency();
-        // testDistributedCacheWithFailures();
-        // testStressTest();
+        testLocalCacheConcurrency();
+        testLocalCacheWithTTL();
+        testLocalCacheDeleteAndExists();
+        testDistributedCacheConcurrency();
+        testDistributedCacheWithFailures();
+        testStressTest();
         testAntiEntropyService();
 
         cout << "\n" << string(60, '*') << endl;
