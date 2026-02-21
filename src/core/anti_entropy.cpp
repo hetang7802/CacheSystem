@@ -32,7 +32,9 @@ void AntiEntropyService::stop() {
     
     stopRequested = true;
     stopCV.notify_one();
-    repairThread.join();
+    if(repairThread.joinable()){
+        repairThread.join();
+    }
 }
 
 void AntiEntropyService::repairLoop() {
