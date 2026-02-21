@@ -4,6 +4,7 @@
 g++ -std=c++17 -pthread -g src/concurrent_test.cpp src/core/*.cpp -I./include -o concurrent_test
 
 ### sample test output
+```
 **********************************************************
 DISTRIBUTED CACHE SYSTEM - CONCURRENT TESTS
 ************************************************************
@@ -250,3 +251,4 @@ marking to stop repair service
 ************************************************************
 ALL TESTS COMPLETED SUCCESSFULLY!
 ************************************************************
+```
