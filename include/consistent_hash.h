@@ -7,6 +7,7 @@
 #include <memory>
 #include <functional>
 #include <cstdint>
+#include <unordered_set>
 
 
 using namespace std;
@@ -63,12 +64,19 @@ public:
      */
     bool removeNode(const string& nodeId);
 
+    // todo : eventually replace findNOde with getReplicaNodes with 1 node to retrieve
     /**
      * Find which node a key belongs to
      * @param key The key to look up
      * @return The node that owns this key, or nullptr if ring is empty
      */
-    shared_ptr<Node> findNode(const string& key) const;
+    shared_ptr<Node> findPrimaryNode(const string& key) const;
+
+    // Find primary node for a key, skipping failed nodes
+    // Returns the first healthy node in ring order
+    // Returns nullptr if all nodes are failed
+    shared_ptr<Node> findPrimaryNode(const string& key, 
+                              const unordered_set<string>& failedNodes) const;
 
     /**
      * Get all nodes in the ring
@@ -93,6 +101,10 @@ public:
      * @return Vector of nodes
      */
     vector<shared_ptr<Node>> getReplicaNodes(const string& key, size_t n = 2) const;
+
+    vector<shared_ptr<Node>> getReplicaNodes(const string& key, 
+                                             size_t n,
+                                             const unordered_set<string>& failedNodes) const;
 
     /**
      * Check if a node exists
@@ -156,6 +168,12 @@ private:
      * @param nodeId The physical node ID
      */
     void removeVirtualNodes(const string& nodeId);
+
+    // for finding hashes
+    hash<string> hashFunc;
+
+    map<uint64_t, shared_ptr<Node>>::const_iterator findPrimaryNodeIt(const string& key, 
+                              const unordered_set<string>& failedNodes) const;
 };
 
 #endif // CONSISTENT_HASH_H

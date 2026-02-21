@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "distributed_cache.h"
+#include "anti_entropy.h"
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -411,6 +412,85 @@ void testStressTest() {
     }
 }
 
+// ==================== ANTI-ENTROPY SERVICE TEST ====================
+
+/**
+ * Test 7: Anti-Entropy Service - Automatic repair of under-replicated data
+ */
+void testAntiEntropyService() {
+    lock_guard g(mTest);
+    cout << "\n" << string(60, '=') << endl;
+    cout << "TEST 7: ANTI-ENTROPY SERVICE - DATA REPAIR" << endl;
+    cout << string(60, '=') << endl;
+
+    // Create distributed cache with replication factor of 3
+    DistributedCache cache(150, 500, Cache::EvictionType::LRU, 3);
+    int numNodes = 5;
+
+    cout << "\nAdding " << numNodes << " nodes to cluster..." << endl;
+    for (int i = 0; i < numNodes; ++i) {
+        cache.addNode("node_" + to_string(i));
+    }
+
+    cout << "Populating cache with 100 items (replication factor: 3)..." << endl;
+    for (int i = 0; i < 100; ++i) {
+        cache.set("repair_key_" + to_string(i), "repair_value_" + to_string(i));
+    }
+
+    cout << "Initial cache size: " << cache.size() << " items" << endl;
+
+    // Simulate node failures to create under-replicated state
+    cout << "\nSimulating failures on 2 nodes to create under-replicated data..." << endl;
+    cache.markNodeFailed("node_0");
+    cache.markNodeFailed("node_1");
+    
+    cout << "  Marked node_0 and node_1 as failed" << endl;
+    cout << "  Failed nodes: " << cache.getFailedNodes().size() << endl;
+
+    cout << "\nStarting Anti-Entropy Service for automatic repair..." << endl;
+    auto startTime = chrono::high_resolution_clock::now();
+
+    // The AntiEntropyService is automatically started in DistributedCache constructor
+    // Just wait for a repair cycle to complete
+    int waitTime = 35;
+    cout << "  Waiting for repair cycles to complete " + to_string(waitTime) + "  seconds)..." << endl;
+
+    this_thread::sleep_for(chrono::seconds(waitTime));
+
+    auto endTime = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::milliseconds>(endTime - startTime);
+
+    cout << "\nRepair cycle completed!" << endl;
+    cout << "  Total Time: " << duration.count() << " ms" << endl;
+
+    // Verify data integrity
+    cout << "\nVerifying data integrity AFTER repair..." << endl;
+    int recoveredCount = 0;
+    int lostCount = 0;
+
+    for (int i = 0; i < 100; ++i) {
+        string key = "repair_key_" + to_string(i);
+        if (cache.exists(key)) {
+            recoveredCount++;
+        } else {
+            lostCount++;
+        }
+    }
+
+    cout << "  Keys accessible after repair:  " << recoveredCount << "/100" << endl;
+    cout << "  Keys lost: " << lostCount << "/" << 100 << endl;
+    cout << "  Cache size after repair: " << cache.size() << " items" << endl;
+
+    cout << "\nNode state after repair:" << endl;
+    for (const auto& node : cache.getAllNodes()) {
+        bool isFailed = cache.isNodeFailed(node);
+        cout << "  " << node << ": " << cache.getNodeSize(node) << " items"
+             << (isFailed ? " [FAILED]" : " [HEALTHY]") << endl;
+    }
+
+    cout << "  Anti-Entropy Service test completed!" << endl;
+}
+
 int main() {
     cout << "\n" << string(60, '*') << endl;
     cout << "DISTRIBUTED CACHE SYSTEM - CONCURRENT TESTS" << endl;
@@ -424,6 +504,7 @@ int main() {
         testDistributedCacheConcurrency();
         testDistributedCacheWithFailures();
         testStressTest();
+        testAntiEntropyService();
 
         cout << "\n" << string(60, '*') << endl;
         cout << "ALL TESTS COMPLETED SUCCESSFULLY!" << endl;

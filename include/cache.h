@@ -45,6 +45,11 @@ struct Value {
  */
 class Cache {
 public:
+    struct ValueWithTtl {
+        string data;
+        bool hasExpiry;
+        optional<int> remainingTtl;  // seconds remaining, nullopt if no expiry
+    };
     // Eviction policy types
     enum class EvictionType {
         NONE,  // No eviction - error when full
@@ -149,6 +154,7 @@ public:
      */
     unordered_map<string, Value> getAllData() const;
 
+    optional<ValueWithTtl> getValueWithTtl(const string& key);
 
 private:
     /**

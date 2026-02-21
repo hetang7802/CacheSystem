@@ -4,25 +4,13 @@
 #include <iomanip>
 #include <iostream>
 #include <cstdint>
+#include <unordered_set>
 
 using namespace std;
 
-// Simple hash function using sum of character values and shifts
-// todo : use MD5 or MurmurHash3
+
 uint64_t ConsistentHashRing::customHash(const string& input) const {
-    uint64_t h = 0;
-    const uint64_t prime = 31;
-    
-    for (size_t i = 0; i < input.length(); ++i) {
-        h = h * prime + static_cast<unsigned char>(input[i]);
-    }
-    
-    // Mix bits to improve distribution
-    h ^= (h >> 33);
-    h *= 0xff51afd7ed558ccdULL;
-    h ^= (h >> 33);
-    
-    return h;
+    return hashFunc(input);
 }
 
 string ConsistentHashRing::getVirtualNodeId(const string& nodeId, int replicaIndex) const {
@@ -30,7 +18,9 @@ string ConsistentHashRing::getVirtualNodeId(const string& nodeId, int replicaInd
 }
 
 ConsistentHashRing::ConsistentHashRing(int numVirtualNodes)
-    : virtualNodesPerPhysicalNode(numVirtualNodes) {}
+    : virtualNodesPerPhysicalNode(numVirtualNodes) {
+        hashFunc = hash<string>();
+    }
 
 bool ConsistentHashRing::addNode(const Node& node) {
     // Check if node already exists
@@ -78,7 +68,7 @@ void ConsistentHashRing::removeVirtualNodes(const string& nodeId) {
     }
 }
 
-shared_ptr<Node> ConsistentHashRing::findNode(const string& key) const {
+shared_ptr<Node> ConsistentHashRing::findPrimaryNode(const string& key) const {
     if (ring.empty()) {
         return nullptr;
     }
@@ -93,6 +83,68 @@ shared_ptr<Node> ConsistentHashRing::findNode(const string& key) const {
         it = ring.begin();
     }
     
+    return it->second;
+}
+
+// OVERLOAD: findNode that skips failed nodes
+map<uint64_t, shared_ptr<Node>>::const_iterator ConsistentHashRing::findPrimaryNodeIt(
+    const string& key, 
+    const unordered_set<string>& failedNodes) const {
+    
+    if (ring.empty()) {
+        return ring.end();
+    }
+    
+    uint64_t keyHash = customHash(key);
+    
+    // Find the first node with hash >= keyHash
+    auto it = ring.lower_bound(keyHash);
+    
+    // If not found, wrap around to the first node in the ring
+    if (it == ring.end()) {
+        it = ring.begin();
+    }
+    
+    // Track starting position to detect if we've checked all nodes
+    auto startIt = it;
+    bool wrappedAround = false;
+    
+    // Find first healthy node
+    while (true) {
+        // Check if we've wrapped around completely
+        if (wrappedAround && it == startIt) {
+            // We've checked all nodes, none are healthy
+            return ring.end();
+        }
+        
+        // Check if this node is healthy
+        if (failedNodes.find(it->second->id) == failedNodes.end()) {
+            // Found a healthy node!
+            return it;
+        }
+        
+        // Move to next node
+        ++it;
+        if (it == ring.end()) {
+            it = ring.begin();
+            wrappedAround = true;
+        }
+    }
+    
+    return ring.end();  // Should never reach here
+}
+
+
+
+// OVERLOAD: findNode that skips failed nodes
+shared_ptr<Node> ConsistentHashRing::findPrimaryNode(
+    const string& key, 
+    const unordered_set<string>& failedNodes) const {
+        
+    auto it = findPrimaryNodeIt(key, failedNodes);
+    if(it==ring.end()){
+        return nullptr;
+    }
     return it->second;
 }
 
@@ -112,7 +164,7 @@ vector<shared_ptr<Node>> ConsistentHashRing::getReplicaNodes(const string& key, 
     
     // Get the primary node and initialize lastNodeId to it
     // This ensures we skip the primary and only collect N DIFFERENT replicas
-    string parentNodeId = it->second->id;
+    string primaryNodeId = it->second->id;
     
     // Start from next position to find replicas (skip primary)
     ++it;
@@ -124,7 +176,7 @@ vector<shared_ptr<Node>> ConsistentHashRing::getReplicaNodes(const string& key, 
     while (replicas.size() < min(nodes.size()-1, n)) {
             
         // Check if same as parent
-        bool isTaken = it->second->id==parentNodeId;
+        bool isTaken = it->second->id==primaryNodeId;
         // Check if already in replicas
         if(!isTaken){
             for (const auto& replica : replicas) {
@@ -142,6 +194,80 @@ vector<shared_ptr<Node>> ConsistentHashRing::getReplicaNodes(const string& key, 
         ++it;
         if (it == ring.end()) {
             it = ring.begin();
+        }
+    }
+    
+    return replicas;
+}
+
+// OVERLOAD: getReplicaNodes with failed nodes filter
+vector<shared_ptr<Node>> ConsistentHashRing::getReplicaNodes(
+    const string& key, 
+    size_t n, 
+    const unordered_set<string>& failedNodes) const {
+    
+    vector<shared_ptr<Node>> replicas;
+    
+    auto it = findPrimaryNodeIt(key, failedNodes);
+
+    // Get the primary node
+    string primaryNodeId = it->second->id;
+    // cout << "[DEBUG] << primary is " << primaryNodeId << endl;
+
+    // Start from next position to find replicas (skip primary)
+    ++it;
+    if (it == ring.end()) {
+        it = ring.begin();
+    }
+    
+    // Track starting position to avoid infinite loop
+    auto startIt = it;
+    bool wrappedAround = false;
+    
+    // Collect N unique healthy replica nodes (different from primary and not failed)
+    while (replicas.size() < min(nodes.size()-1, n)) {
+        
+        // Check if we've wrapped around completely
+        if (wrappedAround && it == startIt) {
+            break;  // We've checked all nodes, can't find more replicas
+        }
+        
+        string currentNodeId = it->second->id;
+        
+        // Check if this node should be skipped
+        bool shouldSkip = false;
+        
+        // Skip if same as primary
+        if (currentNodeId == primaryNodeId) {
+            shouldSkip = true;
+        }
+        
+        // Skip if failed
+        if (!shouldSkip && failedNodes.find(currentNodeId) != failedNodes.end()) {
+            shouldSkip = true;
+        }
+        
+        // Skip if already in replicas
+        if (!shouldSkip) {
+            for (const auto& replica : replicas) {
+                if (replica->id == currentNodeId) {
+                    shouldSkip = true;
+                    break;
+                }
+            }
+        }
+        
+        // Add if not skipped
+        if (!shouldSkip) {
+            // cout << "[DEBUG] : taking " << it->second->id << endl;
+            replicas.push_back(it->second);
+        }
+        
+        // Move to next node
+        ++it;
+        if (it == ring.end()) {
+            it = ring.begin();
+            wrappedAround = true;
         }
     }
     

@@ -7,6 +7,8 @@
 #include <memory>
 #include <shared_mutex>
 #include <unordered_set>
+#include <mutex>
+#include "anti_entropy.h"
 
 using namespace std;
 
@@ -84,7 +86,7 @@ public:
      * Delete a key from primary and all replicas
      * Ensures deletion is consistent across all replica nodes
      */
-    bool del(const string& key);
+    void del(const string& key);
 
     /**
      * Get total number of keys across all nodes
@@ -116,6 +118,12 @@ public:
      * @return Vector of node IDs
      */
     vector<string> getAllNodes() const;
+
+    /**
+     * Get all healthy nodes in the cluster
+     * @return Vector of node IDs
+     */
+    vector<string> getAllHealthyNodes() const;
 
     /**
      * Get number of nodes
@@ -163,7 +171,21 @@ public:
      */
     vector<string> getFailedNodes() const;
 
+    // Check replication health for a key
+    size_t getActualReplicationCount(const string& key) const;
+
+    // Re-replicate a key to restore replication factor
+    bool repairKey(const string& key);
+
+    // Get all keys stored on a specific node
+    vector<string> getKeysOnNode(const string& nodeId) const;
+
+    // getter for replication factor
+    size_t getReplicationFactor() const {return replicationFactor;};  // Number of copies per key (1 primary + replicas)
+
 private:
+    unique_ptr<AntiEntropyService> antiEntropyService;
+
     // Hash ring for key distribution
     ConsistentHashRing hashRing;
     
@@ -190,13 +212,12 @@ private:
      */
     shared_ptr<Cache> getNodeCache(const string& nodeId);
 
-    /**
-     * Get healthy nodes for a key (skips failed nodes)
-     * @param key The key
-     * @param maxNodes Maximum number of nodes to return
-     * @return Vector of healthy node pointers
-     */
-    vector<shared_ptr<Node>> getHealthyNodes(const string& key, size_t maxNodes) const;
+    // Get nodes that should have a key (based on consistent hashing)
+    vector<string> getExpectedNodesForKey(const string &key, unique_lock<shared_mutex> &heldLock) const;
+
+    bool writeWithOptionalTtl(shared_ptr<Cache> cache,
+                              const string &key,
+                              const Value &value);
 };
 
 #endif // DISTRIBUTED_CACHE_H
