@@ -93,8 +93,8 @@ void AntiEntropyService::performRepair() {
             underReplicated++;
             
             // Try to repair
-            cout << "for key " << key << " "<< actualCount << " " << expectedCount << endl;
             if (cache->repairKey(key)) {
+                cout << "reparing key " << key << endl;
                 repaired++;
             } else {
                 failures++;
